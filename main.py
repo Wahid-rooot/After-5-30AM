@@ -1,10 +1,29 @@
 import os
 import re
-import asyncio
+import threading
+from flask import Flask
 from datetime import datetime, timedelta
 import discord
 from discord.ext import commands
 from discord import app_commands
+
+# -------------------------------------------------------------------
+# KEEP ALIVE WEB SERVER (For UptimeRobot 24/7 Pinging)
+# -------------------------------------------------------------------
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "NoName Security Bot is Online!"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
+
+def keep_alive():
+    t = threading.Thread(target=run_flask)
+    t.daemon = True
+    t.start()
 
 # -------------------------------------------------------------------
 # BOT CONFIGURATION & INITIALIZATION (NoName Security)
@@ -174,143 +193,4 @@ async def on_guild_role_delete(role: discord.Role):
 
 @bot.event
 async def on_member_remove(member: discord.Member):
-    guild = member.guild
-    async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.kick):
-        if entry.target.id == member.id:
-            executor = entry.user
-            if executor and not is_whitelisted(executor.id, guild.owner_id):
-                if check_rate_limit(executor.id):
-                    await execute_antinuke_punishment(guild, executor, "Mass Kick Triggered")
-
-@bot.event
-async def on_member_ban(guild: discord.Guild, user: discord.User):
-    async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.ban):
-        if entry.target.id == user.id:
-            executor = entry.user
-            if executor and not is_whitelisted(executor.id, guild.owner_id):
-                if check_rate_limit(executor.id):
-                    await execute_antinuke_punishment(guild, executor, "Mass Ban Triggered")
-
-@bot.event
-async def on_member_join(member: discord.Member):
-    # Detect unauthorized Bot Additions
-    if member.bot:
-        guild = member.guild
-        async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.bot_add):
-            executor = entry.user
-            if executor and not is_whitelisted(executor.id, guild.owner_id):
-                await member.ban(reason=f"[{BOT_NAME} ANTINUKE] Unauthorized Bot Addition")
-                await execute_antinuke_punishment(guild, executor, f"Added Unauthorized Bot ({member.mention})")
-
-
-# -------------------------------------------------------------------
-# COMMANDS: OLYMPUS SECURITY & WHITELIST MANAGEMENT
-# -------------------------------------------------------------------
-@bot.tree.command(name="antinuke-setlog", description=f"Set the {BOT_NAME} security logging channel.")
-@app_commands.checks.has_permissions(administrator=True)
-async def set_log(interaction: discord.Interaction, channel: discord.TextChannel):
-    SECURITY_CONFIG["log_channel_id"] = channel.id
-    await interaction.response.send_message(f"✅ **{BOT_NAME}** security log channel updated to {channel.mention}")
-
-@bot.tree.command(name="whitelist", description=f"Add a trusted user to {BOT_NAME} Antinuke bypass whitelist.")
-@app_commands.checks.has_permissions(administrator=True)
-async def whitelist(interaction: discord.Interaction, user: discord.User):
-    if interaction.user.id != interaction.guild.owner_id:
-        await interaction.response.send_message(f"❌ Only the Server Owner can manage the {BOT_NAME} Whitelist!", ephemeral=True)
-        return
-    SECURITY_CONFIG["whitelist"].add(user.id)
-    await interaction.response.send_message(f"🛡️ **{user.name}** (`{user.id}`) has been added to the **{BOT_NAME}** Antinuke Whitelist.")
-
-@bot.tree.command(name="unwhitelist", description=f"Remove a user from {BOT_NAME} Antinuke whitelist.")
-@app_commands.checks.has_permissions(administrator=True)
-async def unwhitelist(interaction: discord.Interaction, user: discord.User):
-    if interaction.user.id != interaction.guild.owner_id:
-        await interaction.response.send_message(f"❌ Only the Server Owner can manage the {BOT_NAME} Whitelist!", ephemeral=True)
-        return
-    SECURITY_CONFIG["whitelist"].discard(user.id)
-    await interaction.response.send_message(f"⚠️ **{user.name}** (`{user.id}`) removed from **{BOT_NAME}** Whitelist.")
-
-
-# -------------------------------------------------------------------
-# MODERATION COMMANDS (/lock, /warn, /timeout, /mute, /kick, /ban)
-# -------------------------------------------------------------------
-
-# 🔒 /LOCK
-@bot.tree.command(name="lock", description="Locks current channel and stops non-staff members from sending messages.")
-@app_commands.checks.has_permissions(manage_channels=True)
-async def lock_channel(interaction: discord.Interaction, channel: discord.TextChannel = None):
-    target_channel = channel or interaction.channel
-    overwrite = target_channel.overwrites_for(interaction.guild.default_role)
-    overwrite.send_messages = False
-    await target_channel.set_permissions(interaction.guild.default_role, overwrite=overwrite, reason=f"Locked by {interaction.user} via {BOT_NAME}")
-    
-    embed = discord.Embed(
-        title="🔒 Channel Locked",
-        description=f"{target_channel.mention} is now locked. Regular members can no longer send messages.",
-        color=discord.Color.red()
-    )
-    embed.set_footer(text=f"Action enforced by {BOT_NAME}")
-    await interaction.response.send_message(embed=embed)
-
-# 🔓 /UNLOCK
-@bot.tree.command(name="unlock", description="Unlocks target channel.")
-@app_commands.checks.has_permissions(manage_channels=True)
-async def unlock_channel(interaction: discord.Interaction, channel: discord.TextChannel = None):
-    target_channel = channel or interaction.channel
-    overwrite = target_channel.overwrites_for(interaction.guild.default_role)
-    overwrite.send_messages = True
-    await target_channel.set_permissions(interaction.guild.default_role, overwrite=overwrite, reason=f"Unlocked by {interaction.user} via {BOT_NAME}")
-    
-    embed = discord.Embed(
-        title="🔓 Channel Unlocked",
-        description=f"{target_channel.mention} is now unlocked.",
-        color=discord.Color.green()
-    )
-    embed.set_footer(text=f"Action enforced by {BOT_NAME}")
-    await interaction.response.send_message(embed=embed)
-
-# ⚠️ /WARN
-@bot.tree.command(name="warn", description="Issue a formal warning to a member.")
-@app_commands.checks.has_permissions(moderate_members=True)
-async def warn_member(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
-    warnings_db[member.id] = warnings_db.get(member.id, 0) + 1
-    total_warns = warnings_db[member.id]
-    
-    await interaction.response.send_message(f"⚠️ Warned {member.mention} | **Reason:** {reason} (Total Warns: {total_warns})")
-
-# ⏱️ /TIMEOUT & /MUTE
-@bot.tree.command(name="timeout", description="Temporarily mute/timeout a member.")
-@app_commands.checks.has_permissions(moderate_members=True)
-async def timeout_member(interaction: discord.Interaction, member: discord.Member, minutes: int, reason: str = "No reason provided"):
-    duration = timedelta(minutes=minutes)
-    until = datetime.now().astimezone() + duration
-    await member.timeout(until, reason=f"{reason} (via {BOT_NAME})")
-    await interaction.response.send_message(f"🔇 Timed out {member.mention} for **{minutes} minutes** | **Reason:** {reason}")
-
-@bot.tree.command(name="mute", description="Mute a member indefinitely or for specified minutes.")
-@app_commands.checks.has_permissions(moderate_members=True)
-async def mute_member(interaction: discord.Interaction, member: discord.Member, minutes: int = 60, reason: str = "Muted by Staff"):
-    duration = timedelta(minutes=minutes)
-    until = datetime.now().astimezone() + duration
-    await member.timeout(until, reason=f"{reason} (via {BOT_NAME})")
-    await interaction.response.send_message(f"🤐 {member.mention} has been muted for {minutes}m.")
-
-# 👢 /KICK
-@bot.tree.command(name="kick", description="Kick a member from the server.")
-@app_commands.checks.has_permissions(kick_members=True)
-async def kick_member(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
-    await member.kick(reason=f"{reason} (via {BOT_NAME})")
-    await interaction.response.send_message(f"👢 Kicked {member.mention} | **Reason:** {reason}")
-
-# 🔨 /BAN
-@bot.tree.command(name="ban", description="Ban a member from the server.")
-@app_commands.checks.has_permissions(ban_members=True)
-async def ban_member(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
-    await member.ban(reason=f"{reason} (via {BOT_NAME})")
-    await interaction.response.send_message(f"🔨 Banned {member.mention} | **Reason:** {reason}")
-
-
-# -------------------------------------------------------------------
-# RUN BOT
-# -------------------------------------------------------------------
-bot.run(os.environ.get("DISCORD_TOKEN"))
+    guild
